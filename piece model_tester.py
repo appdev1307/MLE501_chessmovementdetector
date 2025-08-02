@@ -23,7 +23,7 @@ file_mapping = {
 
 # Define class names (excluding 'board' since model uses correct labels)
 #class_names = ['b', 'k', 'n', 'p', 'q', 'r', 'B', 'K', 'N', 'P', 'Q', 'R']
-class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'empty', 'k', 'n', 'p', 'q', 'r'] # manual read from onx model
+class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'k', 'n', 'p', 'q', 'r'] # manual read from onx model
 
 # Path to test images and model
 TEST_IMAGE_PATH = "/Users/macintoshhd/Downloads/MSE24/2025_semester_02/MLE501.9/final/templates"
