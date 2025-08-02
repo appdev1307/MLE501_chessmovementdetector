@@ -220,7 +220,7 @@ def load_model(model_path="/Users/macintoshhd/Downloads/MSE24/2025_semester_02/M
 
 def load_class_names():
     """Return class names corresponding to model output indices."""
-    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'empty', 'k', 'n', 'p', 'q', 'r'] # manual read from onx model
+    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b','k', 'n', 'p', 'q', 'r'] # manual read from onx model
     return class_names
 
 def match_piece(square_img, img_name, model_session, class_names, frame_idx, threshold=0.8, debug=False):
