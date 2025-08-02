@@ -18,16 +18,16 @@ file_mapping = {
     'B.png': 'B', 'R.png': 'R', 'R_g.png': 'R', 'P_g.png': 'P', 'K_g.png': 'K',
     'P.png': 'P', 'Q.png': 'Q', 'pb_g.png': 'p', 'rb.png': 'r', 'kb.png': 'k',
     'qb.png': 'q', 'qb_g.png': 'q', 'bb_g.png': 'b', 'nb_g.png': 'n', 'rb_g.png': 'r',
-    'kb_g.png': 'k', 'pb.png': 'p', 'bb.png': 'b', 'nb.png': 'n'
+    'kb_g.png': 'k', 'pb.png': 'p', 'bb.png': 'b', 'nb.png': 'n', 'square_r4_c2.png_input.png': 'empty'
 }
 
 # Define class names (excluding 'board' since model uses correct labels)
 #class_names = ['b', 'k', 'n', 'p', 'q', 'r', 'B', 'K', 'N', 'P', 'Q', 'R']
-class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'k', 'n', 'p', 'q', 'r'] # manual read from onx model
+class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'empty', 'k', 'n', 'p', 'q', 'r'] # manual read from onx model
 
 # Path to test images and model
 TEST_IMAGE_PATH = "/Users/macintoshhd/Downloads/MSE24/2025_semester_02/MLE501.9/final/templates"
-MODEL_PATH = "/Users/macintoshhd/Downloads/MSE24/2025_semester_02/MLE501.9/final/model_dataset/PieceDetection/best.onnx"
+MODEL_PATH = "/Users/macintoshhd/Downloads/MSE24/2025_semester_02/MLE501.9/final/MSE25HN_MLE501.9_NguyenNgocTam_BuiDucLan/best.onnx"
 
 def load_test_images(test_path):
     """Load test images and their expected labels."""
