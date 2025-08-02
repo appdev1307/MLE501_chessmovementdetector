@@ -1,670 +1,805 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
 import os
 import logging
-import cv2
-from collections import defaultdict
-import numpy as np
-import random
-import gc
-import requests
-from datetime import datetime
-import torch
-from ultralytics import YOLO
-from albumentations import Compose, ColorJitter, GaussNoise, RandomBrightnessContrast
-import shutil
-import matplotlib.pyplot as plt
-import pandas as pd
-import json
+import tkinter as tk
+from tkinter import filedialog
+from copy import deepcopy
+import onnxruntime as ort
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-# Constants
-INITIAL_IMAGE_LIMIT = 100
-MAX_FILES_PER_CLASS = 1000
+# Erosion kernel
+EROSION_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-def inspect_dataset(dataset_path, class_names):
-    class_ids = defaultdict(int)
-    sample_labels = []
+# Global variables for manual point selection
+selected_points = []
+click_count = 0
 
-    for split in ['train', 'valid']:
-        label_dir = os.path.join(dataset_path, split, 'labels')
-        if not os.path.exists(label_dir):
-            logger.warning(f"Label directory not found: {label_dir}")
+def select_video_file():
+    """Open a file dialog to select a video file."""
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(
+        title="Select Video File",
+        filetypes=[("Video files", "*.mp4 *.mkv *.avi")]
+    )
+    return file_path
+
+def get_video_duration(video_path):
+    """Get the duration of a video in seconds."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logging.error(f"Cannot open video file: {video_path}")
+        raise ValueError("Cannot open video file")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    
+    if fps <= 0:
+        logging.error("Invalid FPS value in video")
+        raise ValueError("Invalid FPS value")
+    
+    duration = frame_count / fps
+    logging.info(f"Video duration: {duration:.2f} seconds")
+    return duration
+
+def extract_digital_board(image, debug=False):
+    """Detect chessboard region from image."""
+    print('Detecting first chessboard square from image...')
+    h, w = image.shape[:2]
+    crop = image[0:h, 0:w]
+
+    if crop.size == 0:
+        raise ValueError("Cropped image is empty")
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 11, 3)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    edges = cv2.Canny(closed, 50, 150)
+
+    contour_modes = [cv2.RETR_EXTERNAL, cv2.RETR_TREE]
+    best_quad = None
+
+    if debug:
+        os.makedirs('./debug_frames', exist_ok=True)
+        cv2.imwrite('./debug_frames/_1_gray.png', gray)
+        cv2.imwrite('./debug_frames/_2_blurred.png', blurred)
+        cv2.imwrite('./debug_frames/_3_thresh.png', thresh)
+        cv2.imwrite('./debug_frames/_4_closed.png', closed)
+        cv2.imwrite('./debug_frames/_5_edges.png', edges)
+
+    for mode in contour_modes:
+        contours, _ = cv2.findContours(edges.copy(), mode, cv2.CHAIN_APPROX_SIMPLE)
+
+        if debug:
+            debug_img = crop.copy()
+            cv2.drawContours(debug_img, contours, -1, (0, 255, 0), 2)
+            cv2.imwrite(f'./debug_frames/_contours_mode_{mode}.png', debug_img)
+
+        for c in sorted(contours, key=cv2.contourArea, reverse=True):
+            perimeter = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * perimeter, True)
+
+            if len(approx) == 4 and cv2.contourArea(approx) > 5000 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2)
+                rect = order_points(pts)
+
+                side_lengths = [
+                    np.linalg.norm(rect[0] - rect[1]),
+                    np.linalg.norm(rect[1] - rect[2]),
+                    np.linalg.norm(rect[2] - rect[3]),
+                    np.linalg.norm(rect[3] - rect[0])
+                ]
+
+                if min(side_lengths) < 50:
+                    continue
+
+                aspect_ratio = max(side_lengths) / min(side_lengths)
+                if 0.8 < aspect_ratio < 1.2:
+                    best_quad = rect
+                    break
+        if best_quad is not None:
+            break
+
+    if best_quad is None:
+        print("No valid square detected.")
+        return crop, None
+
+    square_w, square_h = 75, 75
+    board_w, board_h = 8 * square_w, 8 * square_h
+
+    top_left = best_quad[0]
+
+    chessboard_corners = np.array([
+        top_left,
+        top_left + np.array([board_w, 0]),
+        top_left + np.array([board_w, board_h]),
+        top_left + np.array([0, board_h])
+    ], dtype=np.float32)
+
+    if debug:
+        debug_img = crop.copy()
+        cv2.polylines(debug_img, [best_quad.astype(int)], True, (255, 0, 0), 3)
+        cv2.polylines(debug_img, [chessboard_corners.astype(int)], True, (0, 0, 255), 3)
+        cv2.imwrite('./debug_frames/_detected_squares.png', debug_img)
+
+    print(f"First square corners: {best_quad}")
+    print(f"Computed chessboard corners: {chessboard_corners}")
+
+    return crop, chessboard_corners
+
+def order_points(pts):
+    """Return consistent order: top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def mouse_callback(event, x, y, flags, param):
+    """Callback for mouse clicks to select chessboard corners."""
+    global selected_points, click_count
+    if event == cv2.EVENT_LBUTTONDOWN:
+        selected_points.append([x, y])
+        click_count += 1
+        logging.info(f"Point {click_count} selected: ({x}, {y})")
+
+def select_board_corners(frame):
+    """Allow user to manually select four chessboard corners."""
+    global selected_points, click_count
+    selected_points = []
+    click_count = 0
+    
+    window_name = "Select Chessboard Corners (Click 4 points, press 'q' to confirm)"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    while click_count < 4:
+        display_frame = frame.copy()
+        for i, pt in enumerate(selected_points):
+            cv2.circle(display_frame, (int(pt[0]), int(pt[1])), 5, (0, 255, 0), -1)
+            cv2.putText(display_frame, f"P{i+1}", (int(pt[0]) + 10, int(pt[1])), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.imshow(window_name, display_frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') and click_count == 4:
+            break
+    
+    cv2.destroyWindow(window_name)
+    if len(selected_points) == 4:
+        return np.array(selected_points, dtype="float32")
+    else:
+        logging.error("Exactly 4 points must be selected")
+        raise ValueError("Exactly 4 points must be selected")
+
+def blur_border(img, border_size=10, blur_kernel=(15, 15)):
+    """Apply a blurred border to an image."""
+    h, w = img.shape[:2]
+    blurred = cv2.GaussianBlur(img, blur_kernel, 0)
+
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.rectangle(mask, (border_size, border_size), (w - border_size, h - border_size), 1, -1)
+    mask = cv2.GaussianBlur(mask, (border_size * 2 + 1, border_size * 2 + 1), 0)
+
+    if len(img.shape) == 2:
+        result = img.astype(np.float32) * mask + blurred.astype(np.float32) * (1 - mask)
+    else:
+        result = img.astype(np.float32)
+        for c in range(3):
+            result[..., c] = result[..., c] * mask + blurred[..., c] * (1 - mask)
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+def load_model(model_path="/Users/macintoshhd/Downloads/MSE24/2025_semester_02/MLE501.9/final/MSE25HN_MLE501.9_NguyenNgocTam_BuiDucLan/best.onnx"):
+    """Load the ONNX model for chess piece classification."""
+    if not os.path.exists(model_path):
+        logging.error(f"ONNX model not found at {model_path}")
+        raise ValueError(f"ONNX model not found at {model_path}")
+    
+    session = ort.InferenceSession(model_path)
+    logging.info(f"Loaded ONNX model from {model_path}")
+    return session
+
+def load_class_names():
+    """Return class names corresponding to model output indices."""
+    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'k', 'n', 'p', 'q', 'r', 'empty']
+    return class_names
+
+def match_piece(square_img, img_name, model_session, class_names, frame_idx, threshold=0.8, debug=False, debug_save=False):
+    """Classify a chess piece in a single square image using the ONNX model."""
+    if square_img is None or square_img.size == 0 or square_img.shape[0] == 0 or square_img.shape[1] == 0:
+        logging.warning(f"Empty or invalid square image: {img_name}")
+        return None
+
+    if len(square_img.shape) == 2:
+        logging.debug(f"Converting grayscale image {img_name} to RGB")
+        square_resized = cv2.cvtColor(square_img, cv2.COLOR_GRAY2RGB)
+    elif len(square_img.shape) == 3 and square_img.shape[2] == 3:
+        logging.debug(f"Converting BGR image {img_name} to RGB")
+        square_resized = cv2.cvtColor(square_img, cv2.COLOR_BGR2RGB)
+    else:
+        logging.error(f"Invalid image channels for {img_name}: {square_img.shape[2]}")
+        return None
+
+    try:
+        square_resized = square_resized.astype(np.float32) / 255.0  # Normalize to [0,1]
+        square_resized = square_resized.transpose(2, 0, 1)  # HWC to CHW
+        img_array = np.expand_dims(square_resized, axis=0)  # Add batch dimension
+
+        logging.debug(f"Input shape for {img_name}: {img_array.shape}")
+
+        input_name = model_session.get_inputs()[0].name
+        outputs = model_session.run(None, {input_name: img_array})
+        probabilities = outputs[0][0]  # Assuming softmax output
+        max_prob = np.max(probabilities)
+        max_idx = np.argmax(probabilities)
+
+        if max_prob >= threshold:
+            best_match = class_names[max_idx]
+            if debug:
+                logging.debug(f"{img_name} match = {best_match} (prob: {max_prob:.2f})")
+            if debug and debug_save:
+                frame_debug_dir = f'./debug_frames/frame_{frame_idx:03d}/match'
+                os.makedirs(frame_debug_dir, exist_ok=True)
+                cv2.imwrite(f'{frame_debug_dir}/{img_name}_input.png', square_img)
+                with open(f'{frame_debug_dir}/{img_name}_probs.txt', 'w') as f:
+                    for cls, prob in zip(class_names, probabilities):
+                        f.write(f"{cls}: {prob:.4f}\n")
+            return best_match
+        return None
+
+    except Exception as e:
+        logging.error(f"Model inference error for {img_name}: {e}")
+        return None
+
+def batch_match_pieces(squares, square_names, model_session, class_names, frame_idx, threshold=0.8, debug=False, debug_save=False):
+    """Classify multiple chess piece squares in a batch using the ONNX model."""
+    inputs = []
+    valid_names = []
+    valid_squares = []
+    for square, name in zip(squares, square_names):
+        if square is None or square.size == 0 or square.shape[0] == 0 or square.shape[1] == 0:
+            logging.warning(f"Empty or invalid square image: {name}")
+            continue
+        if len(square.shape) == 2:
+            square = cv2.cvtColor(square, cv2.COLOR_GRAY2RGB)
+        elif len(square.shape) == 3 and square.shape[2] == 3:
+            square = cv2.cvtColor(square, cv2.COLOR_BGR2RGB)
+        else:
+            logging.error(f"Invalid image channels for {name}: {square.shape[2]}")
+            continue
+        square = square.astype(np.float32) / 255.0
+        square = square.transpose(2, 0, 1)
+        inputs.append(square)
+        valid_names.append(name)
+        valid_squares.append(square)
+    if not inputs:
+        return [None] * len(squares)
+    inputs = np.array(inputs)
+    input_name = model_session.get_inputs()[0].name
+    outputs = model_session.run(None, {input_name: inputs})
+    results = []
+    for i, (probs, name) in enumerate(zip(outputs[0], valid_names)):
+        max_prob = np.max(probs)
+        max_idx = np.argmax(probs)
+        if max_prob >= threshold:
+            best_match = class_names[max_idx]
+            if debug:
+                logging.debug(f"{name} match = {best_match} (prob: {max_prob:.2f})")
+            if debug and debug_save:
+                frame_debug_dir = f'./debug_frames/frame_{frame_idx:03d}/match'
+                os.makedirs(frame_debug_dir, exist_ok=True)
+                cv2.imwrite(f'{frame_debug_dir}/{name}_input.png', cv2.cvtColor(valid_squares[i].transpose(1, 2, 0) * 255.0, cv2.COLOR_RGB2BGR).astype(np.uint8))
+                with open(f'{frame_debug_dir}/{name}_probs.txt', 'w') as f:
+                    for cls, prob in zip(class_names, probs):
+                        f.write(f"{cls}: {prob:.4f}\n")
+            results.append(best_match)
+        else:
+            results.append(None)
+    # Pad results for invalid squares
+    final_results = [None] * len(squares)
+    valid_idx = 0
+    for i, name in enumerate(square_names):
+        if name in valid_names:
+            final_results[i] = results[valid_idx]
+            valid_idx += 1
+    return final_results
+
+def warp_board(crop, points):
+    """Warp the chessboard region to a standard 552x552 image."""
+    rect = order_points(points)
+    dst = np.array([
+        [0, 0],
+        [551, 0],
+        [551, 551],
+        [0, 551]
+    ], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(crop, M, (552, 552))
+    if not warped.size or warped.shape[0] != 552 or warped.shape[1] != 552:
+        logging.error(f"Invalid warped board: shape {warped.shape}")
+        raise ValueError("Warped board is empty or incorrect size")
+    logging.debug(f"Warping matrix: {M}")
+    return warped, M
+
+def split_into_squares(board_img, frame_idx, debug_dir="./debug_frames", debug_save=False):
+    """Split the warped board into 8x8 squares and save debug images with unique names."""
+    frame_debug_dir = os.path.join(debug_dir, f"frame_{frame_idx:03d}")
+    os.makedirs(frame_debug_dir, exist_ok=True)
+    squares = []
+    square_names = []
+    square_positions = []
+    height, width = board_img.shape[:2]
+    dy, dx = 69, 69
+
+    if height < 8 * dy or width < 8 * dx:
+        logging.warning(f"Warped board too small: {width}x{height}, need at least {8*dx}x{8*dy}")
+        top_pad = max(0, 8 * dy - height)
+        left_pad = max(0, 8 * dx - width)
+        board_img = cv2.copyMakeBorder(board_img, 0, top_pad, 0, left_pad, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+        logging.info(f"Padded board to {board_img.shape[1]}x{board_img.shape[0]}")
+
+    for row in range(8):
+        for col in range(8):
+            y_start, y_end = row * dy, (row + 1) * dy
+            x_start, x_end = col * dx, (col + 1) * dx
+            square = board_img[y_start:y_end, x_start:x_end]
+            if not square.size or square.shape[0] < dy or square.shape[1] < dx:
+                logging.warning(f"Empty or undersized square at row {row}, col {col}: shape {square.shape}")
+                continue
+            if len(square.shape) == 2:
+                square = cv2.cvtColor(square, cv2.COLOR_GRAY2BGR)
+            resized = cv2.resize(square, (224, 224), interpolation=cv2.INTER_AREA)
+            name = f"square_r{row}_c{col}_f{frame_idx:03d}.png"
+            if debug_save:
+                debug_path = os.path.join(frame_debug_dir, name)
+                #cv2.imwrite(debug_path, resized)
+                logging.debug(f"Saved square {name} to {debug_path}")
+            squares.append(resized)
+            square_names.append(name)
+            square_positions.append((row, col))
+    return squares, square_names, square_positions
+
+def generate_fen(squares, square_names, model_session, class_names, frame_idx, debug=True, debug_save=False):
+    """Generate FEN string from the board squares."""
+    board = [['' for _ in range(8)] for _ in range(8)]
+    fen_map = {
+        'B': 'B', 'K': 'K', 'N': 'N', 'P': 'P', 'Q': 'Q', 'R': 'R',
+        'b': 'b', 'k': 'k', 'n': 'n', 'p': 'p', 'q': 'q', 'r': 'r',
+        'empty': ''
+    }
+
+    pieces = batch_match_pieces(squares, square_names, model_session, class_names, frame_idx, threshold=0.7, debug=debug, debug_save=debug_save)
+    for i, (piece, name) in enumerate(zip(pieces, square_names)):
+        row, col = i // 8, i % 8
+        if piece and piece in fen_map:
+            board[row][col] = fen_map[piece]
+            if debug:
+                logging.debug(f"Square {name} (r{row}, c{col}): Detected {piece} -> {fen_map[piece]}")
+        else:
+            board[row][col] = ''
+            if debug:
+                logging.debug(f"Square {name} (r{row}, c{col}): No piece detected")
+
+    piece_counts = {}
+    for row in board:
+        for piece in row:
+            if piece:
+                piece_counts[piece] = piece_counts.get(piece, 0) + 1
+
+    max_counts = {'P': 8, 'p': 8, 'N': 2, 'n': 2, 'B': 2, 'b': 2,
+                  'R': 2, 'r': 2, 'Q': 9, 'q': 9, 'K': 1, 'k': 1}
+    for piece, count in piece_counts.items():
+        if count > max_counts.get(piece, 0):
+            logging.warning(f"Invalid piece count for {piece}: {count} exceeds maximum {max_counts.get(piece, 0)}")
+            if debug and debug_save:
+                frame_debug_dir = f'./debug_frames/frame_{frame_idx:03d}'
+                os.makedirs(frame_debug_dir, exist_ok=True)
+                with open(f'{frame_debug_dir}/piece_counts.txt', 'w') as f:
+                    f.write(f"Invalid piece counts: {piece_counts}\n")
+            return None, board
+
+    fen_rows = []
+    for row in board:
+        empty = 0
+        fen_row = ''
+        for square in row:
+            if square == '':
+                empty += 1
+            else:
+                if empty > 0:
+                    fen_row += str(empty)
+                    empty = 0
+                fen_row += square
+        if empty > 0:
+            fen_row += str(empty)
+        fen_rows.append(fen_row)
+
+    fen = '/'.join(fen_rows) + ' w KQkq - 0 1'
+    if debug:
+        logging.info(f"Generated FEN for frame {frame_idx}: {fen}")
+        if debug_save:
+            frame_debug_dir = f'./debug_frames/frame_{frame_idx:03d}'
+            os.makedirs(frame_debug_dir, exist_ok=True)
+            with open(f'{frame_debug_dir}/board_state.txt', 'w') as f:
+                f.write(f"FEN: {fen}\n")
+                for row in board:
+                    f.write(f"{row}\n")
+
+    return fen, board
+
+def detect_movement(prev_board, curr_board):
+    """Detect differences between two chessboard states and return changed squares."""
+    changes = []
+
+    for row in range(8):
+        for col in range(8):
+            prev_piece = prev_board[row][col]
+            curr_piece = curr_board[row][col]
+            if prev_piece != curr_piece:
+                to_square = f"{chr(97 + col)}{8 - row}"
+                
+                if prev_piece == '' and curr_piece != '':
+                    from_square = None
+                    for r in range(8):
+                        for c in range(8):
+                            if prev_board[r][c] == curr_piece and curr_board[r][c] == '':
+                                from_square = f"{chr(97 + c)}{8 - r}"
+                                break
+                        if from_square:
+                            break
+                    if from_square:
+                        change = f"{from_square}-{to_square}"
+                    else:
+                        change = f"-{to_square}"
+                    changes.append(change)
+                
+                elif prev_piece != '' and curr_piece == '':
+                    from_square = f"{chr(97 + col)}{8 - row}"
+                    to_square = None
+                    for r in range(8):
+                        for c in range(8):
+                            if curr_board[r][c] == prev_piece and prev_board[r][c] == '':
+                                to_square = f"{chr(97 + c)}{8 - r}"
+                                break
+                        if to_square:
+                            break
+                    if to_square:
+                        change = f"{from_square}-{to_square}"
+                    else:
+                        change = f"{from_square}-"
+                    changes.append(change)
+                
+                elif prev_piece != '' and curr_piece != '':
+                    from_square = None
+                    for r in range(8):
+                        for c in range(8):
+                            if prev_board[r][c] == curr_piece and curr_board[r][c] == '':
+                                from_square = f"{chr(97 + c)}{8 - r}"
+                                break
+                        if from_square:
+                            break
+                    if from_square:
+                        change = f"{from_square}x{to_square}"
+                    else:
+                        change = f"x{to_square}"
+                    changes.append(change)
+
+    if changes:
+        logging.info(f"Detected board changes: {changes}")
+
+    return changes
+
+def annotate_frame(frame, moves, frame_time, points, M):
+    """Annotate the frame with detected moves, frame time, and highlight changed squares in green."""
+    annotated = frame.copy()
+    
+    dst = np.array([
+        [0, 0],
+        [551, 0],
+        [551, 551],
+        [0, 551]
+    ], dtype="float32")
+    M_inv = cv2.getPerspectiveTransform(dst, order_points(points))
+    
+    points_int = points.astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(annotated, [points_int], isClosed=True, color=(0, 255, 0), thickness=2)
+
+    square_size = 552 / 8
+    highlighted_squares = set()
+
+    for move in moves:
+        move_clean = move[1:] if move[0] in 'prnbqkPRNBQK' else move
+        try:
+            if '-' in move_clean:
+                from_square, to_square = move_clean.split('-')
+            elif 'x' in move_clean:
+                from_square, to_square = move_clean.split('x')
+            else:
+                logging.warning(f"Invalid move format: {move}")
+                continue
+
+            def square_to_coords(square):
+                col = ord(square[0]) - ord('a')
+                row = 8 - int(square[1])
+                if not (0 <= col <= 7 and 1 <= int(square[1]) <= 8):
+                    raise ValueError(f"Invalid square: {square}")
+                return row, col
+
+            squares_to_highlight = []
+            if from_square and from_square != '-':
+                squares_to_highlight.append(from_square)
+            if to_square and to_square != '':
+                squares_to_highlight.append(to_square)
+
+            for square in squares_to_highlight:
+                row, col = square_to_coords(square)
+                if (row, col) in highlighted_squares:
+                    continue
+                highlighted_squares.add((row, col))
+                
+                top_left = np.array([col * square_size, row * square_size], dtype=np.float32)
+                bottom_right = np.array([(col + 1) * square_size, (row + 1) * square_size], dtype=np.float32)
+                square_pts = np.array([
+                    top_left,
+                    [bottom_right[0], top_left[1]],
+                    bottom_right,
+                    [top_left[0], bottom_right[1]]
+                ], dtype=np.float32).reshape(-1, 1, 2)
+
+                square_pts_orig = cv2.perspectiveTransform(square_pts, M_inv)
+                square_pts_orig = square_pts_orig.astype(int).reshape(-1, 2)
+                cv2.polylines(annotated, [square_pts_orig], isClosed=True, color=(0, 255, 0), thickness=3)
+
+        except (ValueError, IndexError) as e:
+            logging.warning(f"Failed to parse or highlight move '{move}': {e}")
             continue
 
-        for label_file in os.listdir(label_dir):
-            if not label_file.endswith('.txt'):
-                continue
-            with open(os.path.join(label_dir, label_file), 'r') as f:
-                lines = f.readlines()
-            if not lines:
-                continue
-            try:
-                class_id = int(lines[0].strip().split()[0])
-                class_ids[class_id] += 1
-                if len(sample_labels) < 5:
-                    sample_labels.append(f"{split}/{label_file}: {lines[0].strip()} (class {class_names[class_id]})")
-            except (ValueError, IndexError):
-                logger.warning(f"Invalid label format in {label_file}")
+    y_offset = 50
+    cv2.putText(annotated, f"Time: {frame_time:.2f}s", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    for i, move in enumerate(moves):
+        cv2.putText(annotated, f"Move: {move}", (10, y_offset + i * 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    return annotated
 
-    logger.info(f"Class ID distribution: {dict(class_ids)}")
-    logger.info("Sample labels:\n" + "\n".join(sample_labels))
-    return class_ids
-
-def preprocess_dataset(dataset_path, output_path, class_names, custom_dataset_path="custom_dataset", max_files_per_class=MAX_FILES_PER_CLASS):
-    class_to_folder = {cls: f"{cls}" for i, cls in enumerate(class_names)}
-    remapped_class_names = [class_to_folder[c] for c in class_names if c != 'board']
-
-    augment = Compose([
-        ColorJitter(brightness=0.3, contrast=0.3, saturation=0.15, hue=0.05, p=0.5),
-        GaussNoise(p=0.3),
-        RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5)
-    ])
-
-    image_counts = {'train': defaultdict(int), 'valid': defaultdict(int)}
-    original_class_counts = defaultdict(int)
-    remapped_class_counts = defaultdict(int)
-    custom_files_processed = defaultdict(list)
-    r_files_found = []
-
-    for split in ['train', 'valid']:
-        for cls in remapped_class_names:
-            os.makedirs(os.path.join(output_path, split, cls), exist_ok=True)
-
-    if dataset_path and os.path.exists(dataset_path):
-        processed_images = 0
-        all_files_processed = False
-
-        for split in ['train', 'valid']:
-            image_dir = os.path.join(dataset_path, split, 'images')
-            label_dir = os.path.join(dataset_path, split, 'labels')
-
-            if not os.path.exists(image_dir) or not os.path.exists(label_dir):
-                logger.warning(f"Missing image or label directory for {split}")
-                continue
-
-            image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.png'))]
-
-            for img_file in image_files:
-                if all_files_processed or processed_images >= INITIAL_IMAGE_LIMIT:
+def main(start_time=0, end_time=10, frame_interval=1.0, debug_save=True):
+    """Main function to process video, detect chessboard differences, and highlight in a loop."""
+    out = None
+    cap = None
+    try:
+        video_path = select_video_file()
+        if not video_path:
+            logging.error("No video file selected")
+            raise ValueError("No video file selected")
+        
+        if not os.path.exists(video_path):
+            logging.error(f"Video file does not exist: {video_path}")
+            raise ValueError(f"Video file does not exist: {video_path}")
+        
+        duration = get_video_duration(video_path)
+        if start_time < 0:
+            logging.warning(f"Start time ({start_time}s) cannot be negative. Setting to 0.")
+            start_time = 0
+        if end_time > duration:
+            logging.warning(f"Requested end_time ({end_time}s) exceeds video duration ({duration}s). Setting end_time to {duration}s.")
+            end_time = duration
+        if start_time >= end_time:
+            logging.error(f"Start time ({start_time}s) must be less than end time ({end_time}s)")
+            raise ValueError("Start time must be less than end time")
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logging.error(f"Cannot open video file: {video_path}")
+            raise ValueError("Cannot open video file")
+        
+        # Initialize video writer
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            logging.error("Invalid FPS value in video")
+            raise ValueError("Invalid FPS value")
+        
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        output_path = "annotated_chess_moves.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps / frame_interval, (frame_width, frame_height))
+        
+        # Clear debug directory to prevent overwrites
+        if debug_save:
+            debug_root = "./debug_frames"
+            if os.path.exists(debug_root):
+                import shutil
+                shutil.rmtree(debug_root)
+                logging.info(f"Cleared debug directory {debug_root}")
+            os.makedirs(debug_root, exist_ok=True)
+        
+        # Set video to start_time
+        start_frame = int(start_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        actual_start_time = cap.get(cv2.CAP_PROP_POS_FRAMES) / fps
+        if abs(actual_start_time - start_time) > 0.1:
+            logging.warning(f"Actual start time ({actual_start_time:.2f}s) differs from requested ({start_time}s)")
+        
+        # Chessboard detection
+        window_name = "Chessboard Detection (Press 'q' to select corners manually)"
+        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+        board_detected = False
+        board_points = None
+        
+        # Read first frame at start_time for chessboard detection
+        ret, frame = cap.read()
+        if not ret:
+            logging.error(f"Failed to read frame at start time {start_time}s")
+            raise ValueError("Failed to read initial frame")
+        
+        crop, points = extract_digital_board(frame, debug=debug_save)
+        if points is not None:
+            display_frame = frame.copy()
+            points_int = points.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(display_frame, [points_int], True, (0, 255, 0), 2)
+            cv2.putText(display_frame, "Chessboard detected. Press 'a' to accept, 'c' for hardcoded ROI, 'm' for manual ROI", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.imshow(window_name, display_frame)
+            
+            while True:
+                key = cv2.waitKey(0) & 0xFF
+                if key == ord('a'):
+                    board_detected = True
+                    board_points = points
+                    logging.info("Accepted automatically detected chessboard points")
                     break
-                img_path = os.path.join(image_dir, img_file)
-                label_path = os.path.join(label_dir, img_file.rsplit('.', 1)[0] + '.txt')
-
-                if not os.path.exists(label_path):
-                    continue
-
-                try:
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        logger.error(f"Failed to load image {img_path}, skipping")
-                        continue
-
-                    h, w = img.shape[:2]
-                    with open(label_path, 'r') as f:
-                        lines = f.readlines()
-
-                    for i, line in enumerate(lines):
-                        if all_files_processed or processed_images >= INITIAL_IMAGE_LIMIT:
-                            break
-                        parts = line.strip().split()
-                        if len(parts) != 5:
-                            logger.warning(f"Invalid label format in {img_file}, line {i+1}")
-                            continue
-
-                        try:
-                            class_id, x_center, y_center, width, height = map(float, parts)
-                            class_id = int(class_id)
-                            if class_id >= len(class_names):
-                                logger.warning(f"Class ID {class_id} exceeds class_names in {img_file}")
-                                continue
-
-                            orig_class = class_names[class_id]
-                            original_class_counts[orig_class] += 1
-                            mapped_class = class_to_folder[orig_class]
-                            if orig_class == 'board':
-                                continue
-
-                            total_class_count = image_counts['train'][mapped_class] + image_counts['valid'][mapped_class]
-                            if total_class_count >= max_files_per_class:
-                                continue
-
-                            target_split = 'train'
-                            if image_counts['train'][mapped_class] >= int(max_files_per_class * 0.8) and image_counts['valid'][mapped_class] < int(max_files_per_class * 0.2):
-                                target_split = 'valid'
-
-                            if mapped_class not in remapped_class_names:
-                                logger.warning(f"Invalid mapped class '{mapped_class}' for {img_file}, line {i+1}, skipping")
-                                continue
-
-                            x_center *= w; y_center *= h; width *= w; height *= h
-                            x1, y1 = int(max(x_center - width / 2, 0)), int(max(y_center - height / 2, 0))
-                            x2, y2 = int(min(x_center + width / 2, w)), int(min(y_center + height / 2, h))
-                            cropped = img[y1:y2, x1:x2]
-                            if cropped.size == 0:
-                                logger.warning(f"Empty crop for {img_file}, line {i+1}")
-                                continue
-
-                            cropped = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_AREA)
-                            if orig_class.islower():
-                                img_yuv = cv2.cvtColor(cropped, cv2.COLOR_BGR2YUV)
-                                img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
-                                cropped = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-
-                            save_name = f"orig_{img_file.rsplit('.', 1)[0]}_{i}.jpg"
-                            save_path = os.path.join(output_path, target_split, mapped_class, save_name)
-                            cv2.imwrite(save_path, cropped)
-                            image_counts[target_split][mapped_class] += 1
-                            remapped_class_counts[mapped_class] += 1
-
-                            aug_count = 2 if orig_class.islower() else 1
-                            for aug_idx in range(aug_count):
-                                if image_counts[target_split][mapped_class] >= max_files_per_class:
-                                    break
-                                augmented = augment(image=cropped)
-                                img_aug = augmented['image']
-                                save_name_aug = f"orig_{img_file.rsplit('.', 1)[0]}_{i}_aug{aug_idx}.jpg"
-                                save_path_aug = os.path.join(output_path, target_split, mapped_class, save_name_aug)
-                                cv2.imwrite(save_path_aug, img_aug)
-                                image_counts[target_split][mapped_class] += 1
-                                remapped_class_counts[mapped_class] += 1
-
-                            processed_images += 1
-                            if processed_images % 100 == 0:
-                                logger.info(f"Processed {processed_images} images")
-
-                        except Exception as e:
-                            logger.error(f"Error processing {img_file}, line {i+1}: {e}")
-                        finally:
-                            if 'cropped' in locals():
-                                del cropped
-                            gc.collect()
-
-                finally:
-                    if 'img' in locals():
-                        del img
-                    gc.collect()
-
-        if processed_images > 0:
-            logger.info(f"Total images processed: {processed_images}")
-
-        if processed_images >= INITIAL_IMAGE_LIMIT and not all_files_processed:
-            for split in ['train', 'valid']:
-                image_dir = os.path.join(dataset_path, split, 'images')
-                label_dir = os.path.join(dataset_path, split, 'labels')
-                if not os.path.exists(image_dir) or not os.path.exists(label_dir):
-                    logger.warning(f"Missing image or label directory for {split}")
-                    continue
-
-                image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.png'))]
-                for img_file in image_files:
-                    if all_files_processed:
-                        break
-                    img_path = os.path.join(image_dir, img_file)
-                    label_path = os.path.join(label_dir, img_file.rsplit('.', 1)[0] + '.txt')
-                    if not os.path.exists(label_path):
-                        continue
-
-                    try:
-                        img = cv2.imread(img_path)
-                        if img is None:
-                            logger.error(f"Failed to load image {img_path}, skipping")
-                            continue
-
-                        h, w = img.shape[:2]
-                        with open(label_path, 'r') as f:
-                            lines = f.readlines()
-
-                        for i, line in enumerate(lines):
-                            if all_files_processed:
-                                break
-                            parts = line.strip().split()
-                            if len(parts) != 5:
-                                logger.warning(f"Invalid label format in {img_file}, line {i+1}")
-                                continue
-
-                            try:
-                                class_id, x_center, y_center, width, height = map(float, parts)
-                                class_id = int(class_id)
-                                if class_id >= len(class_names):
-                                    logger.warning(f"Class ID {class_id} exceeds class_names in {img_file}")
-                                    continue
-
-                                orig_class = class_names[class_id]
-                                mapped_class = class_to_folder[orig_class]
-                                if orig_class == 'board':
-                                    continue
-
-                                total_class_count = image_counts['train'][mapped_class] + image_counts['valid'][mapped_class]
-                                if total_class_count >= max_files_per_class:
-                                    continue
-
-                                target_split = 'train'
-                                if image_counts['train'][mapped_class] >= int(max_files_per_class * 0.8) and image_counts['valid'][mapped_class] < int(max_files_per_class * 0.2):
-                                    target_split = 'valid'
-
-                                if mapped_class not in remapped_class_names:
-                                    logger.warning(f"Invalid mapped class '{mapped_class}' for {img_file}, line {i+1}, skipping")
-                                    continue
-
-                                x_center *= w; y_center *= h; width *= w; height *= h
-                                x1, y1 = int(max(x_center - width / 2, 0)), int(max(y_center - height / 2, 0))
-                                x2, y2 = int(min(x_center + width / 2, w)), int(min(y_center + height / 2, h))
-                                cropped = img[y1:y2, x1:x2]
-                                if cropped.size == 0:
-                                    logger.warning(f"Empty crop for {img_file}, line {i+1}")
-                                    continue
-
-                                cropped = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_AREA)
-                                if orig_class.islower():
-                                    img_yuv = cv2.cvtColor(cropped, cv2.COLOR_BGR2YUV)
-                                    img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
-                                    cropped = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-
-                                save_name = f"orig_{img_file.rsplit('.', 1)[0]}_{i}_bal.jpg"
-                                save_path = os.path.join(output_path, target_split, mapped_class, save_name)
-                                cv2.imwrite(save_path, cropped)
-                                image_counts[target_split][mapped_class] += 1
-                                remapped_class_counts[mapped_class] += 1
-
-                                aug_count = 2 if orig_class.islower() else 1
-                                for aug_idx in range(aug_count):
-                                    if image_counts[target_split][mapped_class] >= max_files_per_class:
-                                        break
-                                    augmented = augment(image=cropped)
-                                    img_aug = augmented['image']
-                                    save_name_aug = f"orig_{img_file.rsplit('.', 1)[0]}_{i}_bal_aug{aug_idx}.jpg"
-                                    save_path_aug = os.path.join(output_path, target_split, mapped_class, save_name_aug)
-                                    cv2.imwrite(save_path_aug, img_aug)
-                                    image_counts[target_split][mapped_class] += 1
-                                    remapped_class_counts[mapped_class] += 1
-
-                                min_count = min(image_counts['train'][cls] + image_counts['valid'][cls] for cls in remapped_class_names)
-                                max_count = max(image_counts['train'][cls] + image_counts['valid'][cls] for cls in remapped_class_names)
-                                if min_count == max_count or max_count >= max_files_per_class:
-                                    all_files_processed = True
-                                    logger.info(f"Processed {sum(image_counts['train'].values()) + sum(image_counts['valid'].values())} files, all classes balanced (min: {min_count}, max: {max_count}), stopping")
-
-                            except Exception as e:
-                                logger.error(f"Error processing {img_file}, line {i+1}: {e}")
-                            finally:
-                                if 'cropped' in locals():
-                                    del cropped
-                                gc.collect()
-
-                    finally:
-                        if 'img' in locals():
-                            del img
-                        gc.collect()
-
-    logger.info(f"Before 80/20 enforcement - Train: {dict(image_counts['train'])}")
-    logger.info(f"Before 80/20 enforcement - Valid: {dict(image_counts['valid'])}")
-
-    for cls in remapped_class_names:
-        train_count = image_counts['train'][cls]
-        valid_count = image_counts['valid'][cls]
-        total_count = train_count + valid_count
-        if total_count > max_files_per_class:
-            total_count = max_files_per_class
-        train_target = int(total_count * 0.8)
-        valid_target = total_count - train_target
-
-        if train_count > train_target:
-            excess = train_count - train_target
-            cls_dir = os.path.join(output_path, 'train', cls)
-            images = [os.path.join(cls_dir, f) for f in os.listdir(cls_dir) if f.endswith('.jpg')]
-            if len(images) > train_target:
-                images_to_move = random.sample(images, excess)
-                for img_path in images_to_move:
-                    if not os.path.exists(img_path):
-                        logger.warning(f"File {img_path} does not exist, skipping")
-                        continue
-                    valid_img_path = os.path.normpath(img_path.replace('train', 'valid'))
-                    if os.path.exists(valid_img_path):
-                        logger.warning(f"File {valid_img_path} already exists, skipping")
-                        continue
-                    os.makedirs(os.path.dirname(valid_img_path), exist_ok=True)
-                    os.rename(img_path, valid_img_path)
-                    image_counts['train'][cls] -= 1
-                    image_counts['valid'][cls] += 1
-        elif train_count < train_target and valid_count > 0:
-            to_move = min(train_target - train_count, valid_count)
-            cls_dir_valid = os.path.join(output_path, 'valid', cls)
-            images = [os.path.join(cls_dir_valid, f) for f in os.listdir(cls_dir_valid) if f.endswith('.jpg')]
-            if len(images) >= to_move:
-                images_to_move = random.sample(images, to_move)
-                for img_path in images_to_move:
-                    if not os.path.exists(img_path):
-                        logger.warning(f"File {img_path} does not exist, skipping")
-                        continue
-                    train_img_path = os.path.normpath(img_path.replace('valid', 'train'))
-                    if os.path.exists(train_img_path):
-                        logger.warning(f"File {train_img_path} already exists, skipping")
-                        continue
-                    os.makedirs(os.path.dirname(train_img_path), exist_ok=True)
-                    os.rename(img_path, train_img_path)
-                    image_counts['valid'][cls] -= 1
-                    image_counts['train'][cls] += 1
-
-    logger.info(f"Final counts - Train: {dict(image_counts['train'])}")
-    logger.info(f"Final counts - Valid: {dict(image_counts['valid'])}")
-
-    if os.path.exists(custom_dataset_path):
-        processed_custom = 0
-        for cls in remapped_class_names:
-            src_class_dir = os.path.join(custom_dataset_path, cls)
-            if not os.path.exists(src_class_dir):
-                logger.warning(f"Custom class directory {src_class_dir} not found")
-                continue
-
-            for file_name in os.listdir(src_class_dir):
-                if not file_name.lower().endswith(('.jpg', '.png')):
-                    continue
-                target_class = cls
-                if target_class not in remapped_class_names:
-                    logger.warning(f"Target class {target_class} not in remapped_class_names, skipping")
-                    continue
-                custom_files_processed[target_class].append(file_name)
-                if target_class == class_to_folder['r']:
-                    r_files_found.append(file_name)
-
-                src_path = os.path.join(src_class_dir, file_name)
-                img = cv2.imread(src_path)
-                if img is None:
-                    logger.warning(f"Failed to load custom image {src_path}")
-                    continue
-
-                img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
-                if target_class.islower():
-                    img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
-                    img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
-                    img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-
-                target_split = 'train'
-                save_name = f"custom_{file_name.rsplit('.', 1)[0]}.jpg"
-                save_path = os.path.join(output_path, target_split, target_class, save_name)
-                cv2.imwrite(save_path, img)
-                image_counts[target_split][target_class] += 1
-                remapped_class_counts[target_class] += 1
-                processed_images += 1
-                processed_custom += 1
-
-                if processed_images % 100 == 0:
-                    logger.info(f"Processed {processed_images} images")
-
-                del img
-                gc.collect()
-
-        if processed_custom > 0:
-            logger.info(f"Total custom images processed: {processed_custom}")
-        logger.info(f"Custom files processed: {dict(custom_files_processed)}")
-        missing_classes = [cls for cls in remapped_class_names if cls not in custom_files_processed]
-        if missing_classes:
-            logger.warning(f"No custom files for classes: {missing_classes}")
-
-    return image_counts, remapped_class_names
-
-def download_dataset(dataset_path):
-    url = "https://universe.roboflow.com/ds/lEIeDLYdtb?key=ytHQpJZNeT"
-    try:
-        if not os.path.exists(dataset_path):
-            os.makedirs(dataset_path)
-        os.chdir(dataset_path)
-        os.system('curl -L "' + url + '" -o roboflow.zip')
-        os.system('unzip -q roboflow.zip')
-        os.system('rm roboflow.zip')
-        logger.info(f"Dataset downloaded and unzipped to {dataset_path}")
-    except Exception as e:
-        logger.error(f"curl failed: {e}")
-        try:
-            logger.info("Attempting download with requests as fallback...")
-            response = requests.get(url, stream=True)
-            if response.status_code == 200:
-                with open('roboflow.zip', 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                os.system('unzip -q roboflow.zip')
-                os.system('rm roboflow.zip')
-                logger.info(f"Dataset downloaded and unzipped to {dataset_path} via fallback")
-            else:
-                logger.error(f"Download failed with status code {response.status_code}")
-                raise
-        except Exception as e2:
-            logger.error(f"Fallback download failed: {e2}")
-            raise
-    finally:
-        os.chdir(os.path.dirname(dataset_path) or os.getcwd())
-
-def plot_training_metrics(results, output_path):
-    results_csv_path = os.path.join(output_path, 'results.csv')
-
-    if not os.path.exists(results_csv_path):
-        logger.error(f"Results CSV file not found at {results_csv_path}")
-        return
-
-    try:
-        df = pd.read_csv(results_csv_path)
-        logger.info(f"Available columns in results.csv: {df.columns.tolist()}")
-
-        epochs = df['epoch'].values + 1
-        train_loss = df['train/loss'].values
-        val_loss = df['val/loss'].values
-        val_acc_top1 = df['metrics/accuracy_top1'].values
-        val_acc_top5 = df['metrics/accuracy_top5'].values
-
-        precision = df.get('metrics/precision', None)
-        recall = df.get('metrics/recall', None)
-        f1 = df.get('metrics/f1', None)
-        speed = df.get('speed', None)
-
-        if precision is None:
-            logger.warning("Precision not found in results.csv")
-        if recall is None:
-            logger.warning("Recall not found in results.csv")
-        if f1 is None:
-            logger.warning("F1-score not found in results.csv")
-        if speed is None:
-            logger.warning("Speed (inference time) not found in results.csv")
-
-        fig, ax1 = plt.subplots(figsize=(12, 8))
-
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss', color='tab:blue')
-        ax1.plot(epochs, train_loss, label='Train Loss', color='tab:blue')
-        ax1.plot(epochs, val_loss, label='Validation Loss', color='tab:orange')
-        ax1.tick_params(axis='y', labelcolor='tab:blue')
-        ax1.legend(loc='upper left')
-
-        ax2 = ax1.twinx()
-        ax2.set_ylabel('Accuracy', color='tab:green')
-        ax2.plot(epochs, val_acc_top1, label='Validation Accuracy Top-1', color='tab:green', linestyle='--')
-        ax2.plot(epochs, val_acc_top5, label='Validation Accuracy Top-5', color='tab:red', linestyle='-.')
-        ax2.tick_params(axis='y', labelcolor='tab:green')
-        ax2.legend(loc='upper right')
-
-        if precision is not None or recall is not None or f1 is not None:
-            ax3 = ax1.twinx()
-            ax3.spines['right'].set_position(('outward', 60))
-            ax3.set_ylabel('Precision/Recall/F1', color='tab:purple')
-            if precision is not None:
-                ax3.plot(epochs, precision, label='Precision', color='tab:purple', linestyle=':')
-            if recall is not None:
-                ax3.plot(epochs, recall, label='Recall', color='tab:cyan', linestyle=':')
-            if f1 is not None:
-                ax3.plot(epochs, f1, label='F1-Score', color='tab:pink', linestyle=':')
-            ax3.tick_params(axis='y', labelcolor='tab:purple')
-            ax3.legend(loc='lower right')
-
-        if speed is not None:
-            fig_speed, ax_speed = plt.subplots(figsize=(10, 6))
-            ax_speed.plot(epochs, speed, label='Inference Speed (ms/image)', color='tab:gray')
-            ax_speed.set_xlabel('Epoch')
-            ax_speed.set_ylabel('Speed (ms/image)', color='tab:gray')
-            ax_speed.tick_params(axis='y', labelcolor='tab:gray')
-            ax_speed.legend(loc='upper right')
-            plt.title('Inference Speed per Epoch')
-            speed_plot_path = os.path.join(output_path, 'speed_metrics.png')
-            plt.savefig(speed_plot_path)
-            plt.close(fig_speed)
-            logger.info(f"Speed metrics plot saved to {speed_plot_path}")
-
-        plt.title('Training and Validation Metrics')
-        fig.tight_layout()
-
-        plot_path = os.path.join(output_path, 'training_metrics.png')
-        plt.savefig(plot_path)
-        plt.close(fig)
-
-        logger.info(f"Training metrics plot saved to {plot_path}")
-
-    except KeyError as e:
-        logger.error(f"Error accessing metrics in results.csv: {e}. Available columns: {df.columns.tolist()}")
-    except Exception as e:
-        logger.error(f"Error plotting training metrics: {e}")
-
-def main():
-    working_dir = '/content/'
-    os.makedirs(working_dir, exist_ok=True)
-    dataset_path = os.path.join(working_dir, "dataset")
-    output_path = "/content/chess_classification_dataset"
-    custom_dataset_path = "/content/drive/MyDrive/MSE24_HN/chess_dataset"
-
-    download_dataset(dataset_path)
-
-    if not os.path.exists(os.path.join(dataset_path, 'train')) or not os.path.exists(os.path.join(dataset_path, 'valid')):
-        logger.error("Missing 'train' or 'valid' folders after download")
-        return
-
-    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'board', 'k', 'n', 'p', 'q', 'r']
-    inspect_dataset(dataset_path, class_names)
-
-    image_counts, remapped_class_names = preprocess_dataset(dataset_path, output_path, class_names, custom_dataset_path, max_files_per_class=MAX_FILES_PER_CLASS)
-
-    train_dir = os.path.join(output_path, 'train')
-    valid_dir = os.path.join(output_path, 'valid')
-
-    if not os.path.exists(train_dir) or not os.path.exists(valid_dir):
-        logger.error("Preprocessed folders missing.")
-        return
-
-    if sum(image_counts['train'].values()) == 0 or sum(image_counts['valid'].values()) == 0:
-        logger.error("No images after preprocessing.")
-        return
-
-    try:
-        model = YOLO("yolov8m-cls.pt")
-        logger.info("YOLOv8m-cls model loaded successfully.")
-    except Exception as e:
-        logger.error(f"Error loading YOLOv8m-cls model: {e}")
-        return
-
-    try:
-        if torch.cuda.is_available():
-            device = 0
-            logger.info(f"GPU available: {torch.cuda.get_device_name(0)}")
+                elif key == ord('c'):
+                    board_detected = True
+                    board_points = np.array([
+                        [1280, 240],
+                        [1879, 240],
+                        [1879, 836],
+                        [1280, 836]
+                    ], dtype="float32")
+                    logging.info("Using hardcoded chessboard points")
+                    break
+                elif key == ord('m'):
+                    board_points = select_board_corners(frame)
+                    board_detected = True
+                    logging.info("Manually selected chessboard points")
+                    break
         else:
-            device = 'cpu'
-            logger.warning("No GPU detected, falling back to CPU. Training may be slower.")
+            logging.info("Automatic chessboard detection failed")
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('q'):
+                board_points = select_board_corners(frame)
+                board_detected = True
+        
+        if not board_detected:
+            logging.info("No chessboard detected automatically, using hardcoded points")
+            board_points = np.array([
+                [1280, 240],
+                [1879, 240],
+                [1879, 836],
+                [1280, 836]
+            ], dtype="float32")
+        
+        # Load model and class names
+        model_session = load_model()
+        class_names = load_class_names()
+        
+        # Reset video to start_time for processing
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        # Process frames in a loop
+        fen_results = []
+        prev_board = None
+        prev_fen = None
+        frame_idx = 0
+        frame_step = max(1, int(frame_interval * fps))
+        end_frame = int(end_time * fps)
+        
+        while cap.isOpened() and cap.get(cv2.CAP_PROP_POS_FRAMES) <= end_frame:
+            frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning(f"Failed to read frame {frame_num}")
+                break
+            
+            # Process only every frame_step frame
+            if frame_num % frame_step != 0:
+                continue
+                
+            frame_time = frame_num / fps
+            logging.info(f"Processing frame at {frame_time:.2f} seconds (frame {frame_num})")
+            
+            try:
+                # Warp board
+                crop = frame
+                board, M = warp_board(crop, board_points)
+                if debug_save:
+                    frame_debug_dir = f'./debug_frames/frame_{frame_idx:03d}'
+                    os.makedirs(frame_debug_dir, exist_ok=True)
+                    cv2.imwrite(f'{frame_debug_dir}/warped_board.png', board)
+                    logging.debug(f"Saved warped board for frame {frame_idx}")
 
-        logger.info(f"Training on device: {device}")
-        start_time = datetime.now()
+                # Piece detection
+                squares, square_names, square_positions = split_into_squares(board, frame_idx, debug_dir="./debug_frames", debug_save=debug_save)
+                fen, curr_board = generate_fen(squares, square_names, model_session, class_names, frame_idx, debug=True, debug_save=debug_save)
+                
+                if fen is None:
+                    logging.warning(f"Skipping frame {frame_idx} at {frame_time:.2f}s due to invalid FEN")
+                    out.write(frame)
+                    frame_idx += 1
+                    continue
+                
+                logging.info(f"Generated FEN at {frame_time:.2f}s: {fen}")
+                
+                # Detect differences
+                moves = []
+                if prev_fen is not None and fen != prev_fen:
+                    moves = detect_movement(prev_board, curr_board)
+                    logging.info(f"Detected moves at {frame_time:.2f}s: {moves}")
+                
+                # Highlight and annotate
+                annotated_frame = annotate_frame(frame, moves, frame_time, board_points, M)
+                
+                cv2.imshow(window_name, annotated_frame)
+                if moves:
+                    cv2.putText(annotated_frame, "Move detected! Press any key to continue.", 
+                                (10, frame_height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.imshow(window_name, annotated_frame)
+                    key = cv2.waitKey(0) & 0xFF
+                    if key == ord('q'):
+                        logging.info("User terminated video display with 'q' key")
+                        break
+                else:
+                    key = cv2.waitKey(100) & 0xFF
+                    if key == ord('q'):
+                        logging.info("User terminated video display with 'q' key")
+                        break
+                
+                out.write(annotated_frame)
+                
+                fen_results.append((frame_time, fen, moves))
+                prev_board = deepcopy(curr_board)
+                prev_fen = fen
+                frame_idx += 1
+            
+            except ValueError as e:
+                logging.error(f"Processing error for frame at {frame_time:.2f}s: {e}")
+                out.write(frame)
+                frame_idx += 1
+                continue
+        
+        print("\nFEN and Move Results:")
+        for frame_time, fen, moves in fen_results:
+            print(f"Time {frame_time:.2f}s: {fen}")
+            if moves:
+                print(f"  Moves: {', '.join(moves)}")
 
-        results = model.train(
-            data=output_path,
-            epochs=30,
-            imgsz=224,
-            batch=16,
-            name="chess_piece_classifier",
-            patience=10,
-            device=device,
-            optimizer="AdamW",
-            lr0=0.0001,
-            lrf=0.01,
-            cos_lr=True,
-            dropout=0.3,
-            weight_decay=0.0005,
-            hsv_h=0.02,
-            hsv_s=0.5,
-            hsv_v=0.3,
-            flipud=0.5,
-            fliplr=0.5,
-            mosaic=0.2,
-            mixup=0.2,
-            verbose=True,
-            project=os.path.join(working_dir, "runs/train"),
-            exist_ok=True
-        )
-
-        training_time = datetime.now() - start_time
-        logger.info(f"Training completed in {training_time.total_seconds() / 60:.2f} minutes. Results saved to {os.path.join(working_dir, 'runs/train', 'chess_piece_classifier')}")
-
-        metrics = model.val()
-        val_results = {
-            'top1_accuracy': metrics.top1,
-            'top5_accuracy': metrics.top5,
-            'precision': getattr(metrics, 'precision', None),
-            'recall': getattr(metrics, 'recall', None),
-            'f1': getattr(metrics, 'f1', None),
-            'speed': getattr(metrics, 'speed', {}).get('inference', None)
-        }
-        logger.info(f"Validation Metrics: {val_results}")
-
-        with open(os.path.join(working_dir, 'runs/train/chess_piece_classifier/val_metrics.json'), 'w') as f:
-            json.dump(val_results, f)
-
-        if hasattr(metrics, 'confusion_matrix'):
-            cm = metrics.confusion_matrix.matrix
-            per_class_precision = []
-            per_class_recall = []
-            per_class_f1 = []
-            for i in range(len(class_names)):
-                tp = cm[i, i]
-                fp = cm[:, i].sum() - tp
-                fn = cm[i, :].sum() - tp
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                per_class_precision.append(precision)
-                per_class_recall.append(recall)
-                per_class_f1.append(f1)
-            logger.info(f"Per-class Precision: {dict(zip(class_names, per_class_precision))}")
-            logger.info(f"Per-class Recall: {dict(zip(class_names, per_class_recall))}")
-            logger.info(f"Per-class F1: {dict(zip(class_names, per_class_f1))}")
-            with open(os.path.join(working_dir, 'runs/train/chess_piece_classifier/per_class_metrics.json'), 'w') as f:
-                json.dump({
-                    'precision': dict(zip(class_names, per_class_precision)),
-                    'recall': dict(zip(class_names, per_class_recall)),
-                    'f1': dict(zip(class_names, per_class_f1))
-                }, f)
-
-        if val_results['speed'] is not None:
-            df = pd.read_csv(os.path.join(working_dir, 'runs/train/chess_piece_classifier/results.csv'))
-            if 'speed' not in df.columns:
-                df['speed'] = [val_results['speed']] * len(df)
-                df.to_csv(os.path.join(working_dir, 'runs/train/chess_piece_classifier/results.csv'), index=False)
-
-        plot_training_metrics(results, os.path.join(working_dir, 'runs/train', 'chess_piece_classifier'))
-
-        export_path = os.path.join(working_dir, 'runs/train/chess_piece_classifier/weights/best.onnx')
-        model.export(
-            format='onnx',
-            imgsz=224,
-            simplify=True,
-            opset=12,
-            dynamic=True
-        )
-        logger.info(f"Model exported to {export_path}")
-
-    except RuntimeError as e:
-        logger.error(f"Training error (possible GPU memory issue): {e}")
-        logger.info("Try reducing batch size (e.g., batch=8) or switching to CPU (device='cpu').")
-        return
     except Exception as e:
-        logger.error(f"Error during training or evaluation: {e}")
-        return
-
-    logger.info("Dataset downloaded, preprocessed, trained, and visualized successfully.")
+        logging.error(f"Video processing error: {e}")
+        print(f"Failed to process video: {e}")
+    finally:
+        if out is not None:
+            out.release()
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    main(start_time=200, end_time=250, frame_interval=1, debug_save=True)
