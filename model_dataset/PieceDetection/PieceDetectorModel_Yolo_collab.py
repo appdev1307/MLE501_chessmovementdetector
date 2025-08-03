@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 INITIAL_IMAGE_LIMIT = 100
-MAX_FILES_PER_CLASS = 2000
+MAX_FILES_PER_CLASS = 1000
 
 def inspect_dataset(dataset_path, class_names):
     class_ids = defaultdict(int)
@@ -376,7 +376,7 @@ def preprocess_dataset(dataset_path, output_path, class_names, custom_dataset_pa
                     continue
 
                 img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
-                if target_class.islower() or target_class == 'empty':
+                if target_class.islower():
                     img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
                     img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
                     img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
@@ -389,18 +389,6 @@ def preprocess_dataset(dataset_path, output_path, class_names, custom_dataset_pa
                 remapped_class_counts[target_class] += 1
                 processed_images += 1
                 processed_custom += 1
-
-                aug_count = 2 if (target_class.islower() or target_class == 'empty') else 1
-                for aug_idx in range(aug_count):
-                    if image_counts[target_split][target_class] >= max_files_per_class:
-                        break
-                    augmented = augment(image=img)
-                    img_aug = augmented['image']
-                    save_name_aug = f"custom_{file_name.rsplit('.', 1)[0]}_aug{aug_idx}.jpg"
-                    save_path_aug = os.path.join(output_path, target_split, target_class, save_name_aug)
-                    cv2.imwrite(save_path_aug, img_aug)
-                    image_counts[target_split][target_class] += 1
-                    remapped_class_counts[target_class] += 1
 
                 if processed_images % 100 == 0:
                     logger.info(f"Processed {processed_images} images")
@@ -548,7 +536,7 @@ def main():
         logger.error("Missing 'train' or 'valid' folders after download")
         return
 
-    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'board', 'k', 'n', 'p', 'q', 'r', 'empty']
+    class_names = ['B', 'K', 'N', 'P', 'Q', 'R', 'b', 'board', 'k', 'n', 'p', 'q', 'r']
     inspect_dataset(dataset_path, class_names)
 
     image_counts, remapped_class_names = preprocess_dataset(dataset_path, output_path, class_names, custom_dataset_path, max_files_per_class=MAX_FILES_PER_CLASS)
